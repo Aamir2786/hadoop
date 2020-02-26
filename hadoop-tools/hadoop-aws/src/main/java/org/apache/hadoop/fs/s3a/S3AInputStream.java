@@ -41,11 +41,15 @@ import org.apache.hadoop.fs.s3a.impl.ChangeTracker;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.io.EOFException;
-import java.io.IOException;
+import java.io.*;
+import java.net.InetAddress;
 import java.net.SocketTimeoutException;
+import java.net.UnknownHostException;
+import java.sql.Timestamp;
+import java.util.Date;
 
 import static org.apache.commons.lang3.StringUtils.isNotEmpty;
+import static org.apache.hadoop.fs.s3a.S3AInstrumentation.METRIC_TAG_FILESYSTEM_ID;
 import static org.apache.hadoop.util.StringUtils.toLowerCase;
 
 /**
@@ -103,6 +107,11 @@ public class S3AInputStream extends FSInputStream implements  CanSetReadahead,
   private S3AInputPolicy inputPolicy;
   private long readahead = Constants.DEFAULT_READAHEAD_RANGE;
 
+  /** Variables for IOTrace. */
+  public static int count = 0;
+  public StringBuilder sb1 = new StringBuilder();
+  public String taskId = "";
+
   /**
    * This is the actual position within the object, used by
    * lazy seek to decide whether to seek on the next read or not.
@@ -156,6 +165,62 @@ public class S3AInputStream extends FSInputStream implements  CanSetReadahead,
         s3Attributes);
     setInputPolicy(ctx.getInputPolicy());
     setReadahead(ctx.getReadahead());
+    taskId = ctx.instrumentation.getRegistry().getTag(METRIC_TAG_FILESYSTEM_ID).value();
+  }
+
+  /** Function for IOTrace. */
+  private void logAndSaveTrace(String nameOfTrace, String fileName, String bufferSize, String position,
+                               String offset, String length, String taskId,
+                               long startTimeMilliseconds){
+
+    Timestamp timestamp = new Timestamp(new Date().getTime());
+    LOG.info("IOTrace_" + nameOfTrace + "_Time Stamp: " + timestamp.toString());
+
+    if(fileName != ""){
+      LOG.info("IOTrace_" + nameOfTrace + "_Filename: " + fileName);
+    }
+    if(bufferSize != ""){
+      LOG.info("IOTrace_" + nameOfTrace + "_bufferSize: " + bufferSize);
+    }
+    if(position != ""){
+      LOG.info("IOTrace_" + nameOfTrace + "_position: " + position);
+    }
+    if(offset != ""){
+      LOG.info("IOTrace_" + nameOfTrace + "_offset: " + offset);
+    }
+    if(length != ""){
+      LOG.info("IOTrace_" + nameOfTrace + "_length: " + length);
+    }
+    LOG.info("IOTrace_" + nameOfTrace + "_taskId: " + taskId);
+
+    String hostName = "";
+    String ipAddress = "";
+    try {
+      InetAddress localHost = InetAddress.getLocalHost();
+      hostName = localHost.getHostName();
+      LOG.info("IOTrace_" + nameOfTrace + "_hostName: " + hostName);
+
+      ipAddress = localHost.getHostAddress().trim();
+      LOG.info("IOTrace_" + nameOfTrace + "_ipAddr: " + ipAddress);
+    } catch (UnknownHostException e) {
+      LOG.error("Cannot obtain host name", e);
+    }
+
+    long finishTimeMilliseconds = System.currentTimeMillis();
+    String durationInMilliseconds = Long.toString(finishTimeMilliseconds - startTimeMilliseconds);
+    LOG.info("IOTrace_" + nameOfTrace + "_durationInMs: " + durationInMilliseconds);
+    LOG.info("IOTrace_" + nameOfTrace + "_AbsolutePath: " + new File(".").getAbsolutePath());
+
+    if (count == 0){
+      sb1.append("timeStamp,nameOfTrace,fileName,bufferSize,position,offset,length,taskID,hostName,ipAddress,durationInMilliseconds" + '\n');
+      sb1.append(timestamp.toString() + "," + nameOfTrace + "," + fileName + ',' + bufferSize + ',' + position + ',' + offset + ',' +
+              length + ',' + taskId + ',' + hostName + ',' + ipAddress + ',' + durationInMilliseconds + '\n');
+      count+=1;
+    }
+    else{
+      sb1.append(timestamp.toString() + "," + nameOfTrace + "," + fileName + ',' + bufferSize + ',' + position + ',' + offset + ',' +
+              length + ',' + taskId + ',' + hostName + ',' + ipAddress + ',' + durationInMilliseconds + '\n');
+    }
   }
 
   /**
@@ -224,6 +289,7 @@ public class S3AInputStream extends FSInputStream implements  CanSetReadahead,
 
   @Override
   public synchronized void seek(long targetPos) throws IOException {
+    long startTimeMilliseconds = System.currentTimeMillis();
     checkNotClosed();
 
     // Do not allow negative seek
@@ -238,6 +304,7 @@ public class S3AInputStream extends FSInputStream implements  CanSetReadahead,
 
     // Lazy seek
     nextReadPos = targetPos;
+    logAndSaveTrace("Seek", pathStr, "", Long.toString(targetPos), "", "", taskId, startTimeMilliseconds);
   }
 
   /**
@@ -263,6 +330,8 @@ public class S3AInputStream extends FSInputStream implements  CanSetReadahead,
    */
   @Retries.OnceTranslated
   private void seekInStream(long targetPos, long length) throws IOException {
+    long startTimeMilliseconds = System.currentTimeMillis();
+
     checkNotClosed();
     if (wrappedStream == null) {
       return;
@@ -327,6 +396,7 @@ public class S3AInputStream extends FSInputStream implements  CanSetReadahead,
     // close the stream; if read the object will be opened at the new pos
     closeStream("seekInStream()", this.contentRangeFinish, false);
     pos = targetPos;
+    logAndSaveTrace("SeekInStream", pathStr, "", Long.toString(pos), "", Long.toString(length), taskId, startTimeMilliseconds);
   }
 
   @Override
@@ -449,6 +519,7 @@ public class S3AInputStream extends FSInputStream implements  CanSetReadahead,
   @Retries.RetryTranslated  // Some retries only happen w/ S3Guard, as intended.
   public synchronized int read(byte[] buf, int off, int len)
       throws IOException {
+    long startTimeMilliseconds = System.currentTimeMillis();
     checkNotClosed();
 
     validatePositionedReadArgs(nextReadPos, buf, off, len);
@@ -498,6 +569,7 @@ public class S3AInputStream extends FSInputStream implements  CanSetReadahead,
     }
     incrementBytesRead(bytesRead);
     streamStatistics.readOperationCompleted(len, bytesRead);
+    logAndSaveTrace("Read", pathStr, "", "", Integer.toString(off), Integer.toString(len), taskId, startTimeMilliseconds);
     return bytesRead;
   }
 
@@ -522,6 +594,7 @@ public class S3AInputStream extends FSInputStream implements  CanSetReadahead,
    */
   @Override
   public synchronized void close() throws IOException {
+
     if (!closed) {
       closed = true;
       try {
@@ -534,6 +607,16 @@ public class S3AInputStream extends FSInputStream implements  CanSetReadahead,
         // merge the statistics back into the FS statistics.
         streamStatistics.close();
       }
+    }
+    try {
+      FileWriter fileWriter = new FileWriter(taskId + "_test.csv", true);
+      BufferedWriter writer = new BufferedWriter(fileWriter);
+      writer.write(sb1.toString());
+      writer.close();
+      LOG.info("done");
+    }
+    catch (IOException e){
+      LOG.error("BOOM!", e.getStackTrace());
     }
   }
 

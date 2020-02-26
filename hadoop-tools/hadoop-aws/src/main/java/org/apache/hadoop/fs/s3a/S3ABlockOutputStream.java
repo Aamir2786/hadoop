@@ -18,9 +18,12 @@
 
 package org.apache.hadoop.fs.s3a;
 
-import java.io.IOException;
-import java.io.OutputStream;
+import java.io.*;
+import java.net.InetAddress;
+import java.net.UnknownHostException;
+import java.sql.Timestamp;
 import java.util.ArrayList;
+import java.util.Date;
 import java.util.List;
 import java.util.Locale;
 import java.util.concurrent.ExecutionException;
@@ -51,6 +54,7 @@ import org.apache.hadoop.fs.s3a.commit.CommitConstants;
 import org.apache.hadoop.fs.s3a.commit.PutTracker;
 import org.apache.hadoop.util.Progressable;
 
+import static org.apache.hadoop.fs.s3a.S3AInstrumentation.METRIC_TAG_FILESYSTEM_ID;
 import static org.apache.hadoop.fs.s3a.S3AUtils.*;
 import static org.apache.hadoop.fs.s3a.Statistic.*;
 import static org.apache.hadoop.io.IOUtils.cleanupWithLogger;
@@ -121,6 +125,11 @@ class S3ABlockOutputStream extends OutputStream implements
    */
   private final PutTracker putTracker;
 
+  /** Variables for IOTrace. */
+  public static int count = 0;
+  public StringBuilder sb1 = new StringBuilder();
+  public String taskId = "";
+
   /**
    * An S3A output stream which uploads partitions in a separate pool of
    * threads; different {@link S3ADataBlocks.BlockFactory}
@@ -172,6 +181,64 @@ class S3ABlockOutputStream extends OutputStream implements
     if (putTracker.initialize()) {
       LOG.debug("Put tracker requests multipart upload");
       initMultipartUpload();
+    }
+    taskId = fs.getInstrumentation().getRegistry().getTag(METRIC_TAG_FILESYSTEM_ID).value();
+
+  }
+
+  /** Function for IOTrace. */
+  private void logAndSaveTrace(String nameOfTrace, String fileName, String bufferSize, String position,
+                               String offset, String length, String taskId,
+                               long startTimeMilliseconds){
+
+
+    Timestamp timestamp = new Timestamp(new Date().getTime());
+    LOG.info("IOTrace_" + nameOfTrace + "_Time Stamp: " + timestamp.toString());
+
+    if(fileName != ""){
+      LOG.info("IOTrace_" + nameOfTrace + "_Filename: " + fileName);
+    }
+    if(bufferSize != ""){
+      LOG.info("IOTrace_" + nameOfTrace + "_bufferSize: " + bufferSize);
+    }
+    if(position != ""){
+      LOG.info("IOTrace_" + nameOfTrace + "_position: " + position);
+    }
+    if(offset != ""){
+      LOG.info("IOTrace_" + nameOfTrace + "_offset: " + offset);
+    }
+    if(length != ""){
+      LOG.info("IOTrace_" + nameOfTrace + "_length: " + length);
+    }
+    LOG.info("IOTrace_" + nameOfTrace + "_taskId: " + taskId);
+
+    String hostName = "";
+    String ipAddress = "";
+    try {
+      InetAddress localHost = InetAddress.getLocalHost();
+      hostName = localHost.getHostName();
+      LOG.info("IOTrace_" + nameOfTrace + "_hostName: " + hostName);
+
+      ipAddress = localHost.getHostAddress().trim();
+      LOG.info("IOTrace_" + nameOfTrace + "_ipAddr: " + ipAddress);
+    } catch (UnknownHostException e) {
+      LOG.error("Cannot obtain host name", e);
+    }
+
+    long finishTimeMilliseconds = System.currentTimeMillis();
+    String durationInMilliseconds = Long.toString(finishTimeMilliseconds - startTimeMilliseconds);
+    LOG.info("IOTrace_" + nameOfTrace + "_durationInMs: " + durationInMilliseconds);
+    LOG.info("IOTrace_" + nameOfTrace + "_AbsolutePath: " + new File(".").getAbsolutePath());
+
+    if (count == 0){
+      sb1.append("timeStamp,nameOfTrace,fileName,bufferSize,position,offset,length,taskID,hostName,ipAddress,durationInMilliseconds" + '\n');
+      sb1.append(timestamp.toString() + "," + nameOfTrace + "," + fileName + ',' + bufferSize + ',' + position + ',' + offset + ',' +
+              length + ',' + taskId + ',' + hostName + ',' + ipAddress + ',' + durationInMilliseconds + '\n');
+      count+=1;
+    }
+    else{
+      sb1.append(timestamp.toString() + "," + nameOfTrace + "," + fileName + ',' + bufferSize + ',' + position + ',' + offset + ',' +
+              length + ',' + taskId + ',' + hostName + ',' + ipAddress + ',' + durationInMilliseconds + '\n');
     }
   }
 
@@ -277,6 +344,7 @@ class S3ABlockOutputStream extends OutputStream implements
   public synchronized void write(byte[] source, int offset, int len)
       throws IOException {
 
+    long startTimeMilliseconds = System.currentTimeMillis();
     S3ADataBlocks.validateWriteArgs(source, offset, len);
     checkOpen();
     if (len == 0) {
@@ -300,6 +368,7 @@ class S3ABlockOutputStream extends OutputStream implements
         uploadCurrentBlock();
       }
     }
+    logAndSaveTrace("Write", "", "", "", Integer.toString(offset), Integer.toString(len), taskId, startTimeMilliseconds);
   }
 
   /**
@@ -404,6 +473,16 @@ class S3ABlockOutputStream extends OutputStream implements
     }
     // Note end of write. This does not change the state of the remote FS.
     writeOperationHelper.writeSuccessful(bytes);
+    try {
+      FileWriter fileWriter = new FileWriter(taskId + "_test.csv", true);
+      BufferedWriter writer = new BufferedWriter(fileWriter);
+      writer.write(sb1.toString());
+      writer.close();
+      LOG.info("done");
+    }
+    catch (IOException e){
+      LOG.error("BOOM!", e.getStackTrace());
+    }
   }
 
   /**

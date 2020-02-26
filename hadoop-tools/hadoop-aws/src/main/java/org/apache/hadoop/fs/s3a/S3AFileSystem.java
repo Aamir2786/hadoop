@@ -18,13 +18,12 @@
 
 package org.apache.hadoop.fs.s3a;
 
-import java.io.File;
-import java.io.FileNotFoundException;
-import java.io.IOException;
-import java.io.InputStream;
-import java.io.InterruptedIOException;
+import java.io.*;
+import java.net.InetAddress;
 import java.net.URI;
+import java.net.UnknownHostException;
 import java.nio.file.AccessDeniedException;
+import java.sql.Timestamp;
 import java.text.DateFormat;
 import java.text.SimpleDateFormat;
 import java.time.Instant;
@@ -164,6 +163,7 @@ import static org.apache.hadoop.fs.impl.AbstractFSBuilderImpl.rejectUnknownManda
 import static org.apache.hadoop.fs.impl.PathCapabilitiesSupport.validatePathCapabilityArgs;
 import static org.apache.hadoop.fs.s3a.Constants.*;
 import static org.apache.hadoop.fs.s3a.Invoker.*;
+import static org.apache.hadoop.fs.s3a.S3AInstrumentation.METRIC_TAG_FILESYSTEM_ID;
 import static org.apache.hadoop.fs.s3a.S3AUtils.*;
 import static org.apache.hadoop.fs.s3a.Statistic.*;
 import static org.apache.commons.lang3.StringUtils.isNotEmpty;
@@ -276,6 +276,11 @@ public class S3AFileSystem extends FileSystem implements StreamCapabilities,
 
   private ITtlTimeProvider ttlTimeProvider;
 
+  /** Variables for IOTrace. */
+  public static int count = 0;
+  public StringBuilder sb1 = new StringBuilder();
+  public String taskId = "";
+
   /**
    * Page size for deletions.
    */
@@ -305,6 +310,62 @@ public class S3AFileSystem extends FileSystem implements StreamCapabilities,
     addDeprecatedKeys();
   }
 
+  /** Function for IOTrace. */
+  private void logAndSaveTrace(String nameOfTrace, String fileName, String bufferSize, String position,
+                               String offset, String length, String taskId,
+                               long startTimeMilliseconds){
+
+
+    Timestamp timestamp = new Timestamp(new Date().getTime());
+    LOG.info("IOTrace_" + nameOfTrace + "_Time Stamp: " + timestamp.toString());
+
+    if(fileName != ""){
+      LOG.info("IOTrace_" + nameOfTrace + "_Filename: " + fileName);
+    }
+    if(bufferSize != ""){
+      LOG.info("IOTrace_" + nameOfTrace + "_bufferSize: " + bufferSize);
+    }
+    if(position != ""){
+      LOG.info("IOTrace_" + nameOfTrace + "_position: " + position);
+    }
+    if(offset != ""){
+      LOG.info("IOTrace_" + nameOfTrace + "_offset: " + offset);
+    }
+    if(length != ""){
+      LOG.info("IOTrace_" + nameOfTrace + "_length: " + length);
+    }
+    LOG.info("IOTrace_" + nameOfTrace + "_taskId: " + taskId);
+
+    String hostName = "";
+    String ipAddress = "";
+    try {
+      InetAddress localHost = InetAddress.getLocalHost();
+      hostName = localHost.getHostName();
+      LOG.info("IOTrace_" + nameOfTrace + "_hostName: " + hostName);
+
+      ipAddress = localHost.getHostAddress().trim();
+      LOG.info("IOTrace_" + nameOfTrace + "_ipAddr: " + ipAddress);
+    } catch (UnknownHostException e) {
+      LOG.error("Cannot obtain host name", e);
+    }
+
+    long finishTimeMilliseconds = System.currentTimeMillis();
+    String durationInMilliseconds = Long.toString(finishTimeMilliseconds - startTimeMilliseconds);
+    LOG.info("IOTrace_" + nameOfTrace + "_durationInMs: " + durationInMilliseconds);
+    LOG.info("IOTrace_" + nameOfTrace + "_AbsolutePath: " + new File(".").getAbsolutePath());
+
+    if (count == 0){
+      sb1.append("timeStamp,nameOfTrace,fileName,bufferSize,position,offset,length,taskID,hostName,ipAddress,durationInMilliseconds" + '\n');
+      sb1.append(timestamp.toString() + "," + nameOfTrace + "," + fileName + ',' + bufferSize + ',' + position + ',' + offset + ',' +
+              length + ',' + taskId + ',' + hostName + ',' + ipAddress + ',' + durationInMilliseconds + '\n');
+      count+=1;
+    }
+    else{
+      sb1.append(timestamp.toString() + "," + nameOfTrace + "," + fileName + ',' + bufferSize + ',' + position + ',' + offset + ',' +
+              length + ',' + taskId + ',' + hostName + ',' + ipAddress + ',' + durationInMilliseconds + '\n');
+    }
+  }
+
   /** Called after a new FileSystem instance is constructed.
    * @param name a uri whose authority section names the host, port, etc.
    *   for this FileSystem
@@ -314,6 +375,8 @@ public class S3AFileSystem extends FileSystem implements StreamCapabilities,
    */
   public void initialize(URI name, Configuration originalConf)
       throws IOException {
+
+    long startTimeMilliseconds = System.currentTimeMillis();
     // get the host; this is guaranteed to be non-null, non-empty
     bucket = name.getHost();
     try {
@@ -460,6 +523,9 @@ public class S3AFileSystem extends FileSystem implements StreamCapabilities,
       stopAllServices();
       throw e;
     }
+
+    taskId = instrumentation.getRegistry().getTag(METRIC_TAG_FILESYSTEM_ID).value();
+    logAndSaveTrace("Initialize", "", "", "", "", "", taskId, startTimeMilliseconds);
 
   }
 
@@ -1010,6 +1076,7 @@ public class S3AFileSystem extends FileSystem implements StreamCapabilities,
       final Optional<S3AFileStatus> providedStatus)
       throws IOException {
 
+    long startTimeMilliseconds = System.currentTimeMillis();
     entryPoint(INVOCATION_OPEN);
     final Path path = qualify(file);
     S3AFileStatus fileStatus = extractOrFetchSimpleFileStatus(path,
@@ -1038,6 +1105,7 @@ public class S3AFileSystem extends FileSystem implements StreamCapabilities,
           readAhead);
     }
     LOG.debug("Opening '{}'", readContext);
+    logAndSaveTrace("open", file.toString(), "", "", "", "", taskId, startTimeMilliseconds);
 
     return new FSDataInputStream(
         new S3AInputStream(
@@ -1129,6 +1197,8 @@ public class S3AFileSystem extends FileSystem implements StreamCapabilities,
   public FSDataOutputStream create(Path f, FsPermission permission,
       boolean overwrite, int bufferSize, short replication, long blockSize,
       Progressable progress) throws IOException {
+
+    long startTimeMilliseconds = System.currentTimeMillis();
     entryPoint(INVOCATION_CREATE);
     final Path path = qualify(f);
     String key = pathToKey(path);
@@ -1161,6 +1231,7 @@ public class S3AFileSystem extends FileSystem implements StreamCapabilities,
     PutTracker putTracker =
         committerIntegration.createTracker(path, key);
     String destKey = putTracker.getDestKey();
+    logAndSaveTrace("Create", f.toString(), Integer.toString(bufferSize), "", "", "", taskId, startTimeMilliseconds);
     return new FSDataOutputStream(
         new S3ABlockOutputStream(this,
             destKey,
@@ -2386,6 +2457,7 @@ public class S3AFileSystem extends FileSystem implements StreamCapabilities,
    */
   @Retries.RetryTranslated
   public boolean delete(Path f, boolean recursive) throws IOException {
+    long startTimeMilliseconds = System.currentTimeMillis();
     try {
       entryPoint(INVOCATION_DELETE);
       DeleteOperation deleteOperation = new DeleteOperation(
@@ -2404,6 +2476,7 @@ public class S3AFileSystem extends FileSystem implements StreamCapabilities,
           LOG.debug("Failed to create fake dir above {}", f, e);
         }
       }
+      logAndSaveTrace("Delete", f.toString(), "", "", "", "", taskId, startTimeMilliseconds);
       return outcome;
     } catch (FileNotFoundException e) {
       LOG.debug("Couldn't delete {} - does not exist: {}", f, e.toString());
@@ -3191,6 +3264,7 @@ public class S3AFileSystem extends FileSystem implements StreamCapabilities,
    */
   @Override
   public void close() throws IOException {
+    long startTimeMilliseconds = System.currentTimeMillis();
     if (closed.getAndSet(true)) {
       // already closed
       return;
@@ -3200,6 +3274,17 @@ public class S3AFileSystem extends FileSystem implements StreamCapabilities,
     try {
       super.close();
     } finally {
+      logAndSaveTrace("Close", "", "", "", "", "", taskId, startTimeMilliseconds);
+      try {
+        FileWriter fileWriter = new FileWriter(taskId + "_test.csv", true);
+        BufferedWriter writer = new BufferedWriter(fileWriter);
+        writer.write(sb1.toString());
+        writer.close();
+        LOG.info("done");
+      }
+      catch (IOException e){
+        LOG.error("BOOM!", e.getStackTrace());
+      }
       stopAllServices();
     }
   }
